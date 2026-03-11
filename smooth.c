@@ -12,6 +12,7 @@
 #define KERNEL_SUM 273.0
 #define MAX_THREADS_TEST 7
 #define EPS 1e-9
+#define REPEATS 30
 
 static const int kernel[5][5] = {
     {1, 4, 7, 4, 1},
@@ -92,7 +93,6 @@ void apply_smoothing_cell(double in[ROWS][COLS], double out[ROWS][COLS], int r, 
             if (ni >= 0 && ni < ROWS && nj >= 0 && nj < COLS) {
                 sum += in[ni][nj] * kernel[ki][kj];
             }
-            /* zero padding otherwise */
         }
     }
 
@@ -186,14 +186,53 @@ int compare_outputs(double a[ROWS][COLS], double b[ROWS][COLS], double tol) {
     for (int i = 0; i < ROWS; i++) {
         for (int j = 0; j < COLS; j++) {
             if (fabs(a[i][j] - b[i][j]) > tol) {
-                fprintf(stderr,
-                        "Mismatch at (%d,%d): %.12f vs %.12f\n",
+                fprintf(stderr, "Mismatch at (%d,%d): %.12f vs %.12f\n",
                         i, j, a[i][j], b[i][j]);
                 return 0;
             }
         }
     }
     return 1;
+}
+
+double benchmark_seq(double in[ROWS][COLS], double out[ROWS][COLS]) {
+    double total = 0.0;
+    for (int r = 0; r < REPEATS; r++) {
+        double start = get_time();
+        smooth_sequential(in, out);
+        total += (get_time() - start);
+    }
+    return total / REPEATS;
+}
+
+double benchmark_omp_static(double in[ROWS][COLS], double out[ROWS][COLS], int threads) {
+    double total = 0.0;
+    for (int r = 0; r < REPEATS; r++) {
+        double start = get_time();
+        smooth_openmp_static(in, out, threads);
+        total += (get_time() - start);
+    }
+    return total / REPEATS;
+}
+
+double benchmark_omp_dynamic(double in[ROWS][COLS], double out[ROWS][COLS], int threads) {
+    double total = 0.0;
+    for (int r = 0; r < REPEATS; r++) {
+        double start = get_time();
+        smooth_openmp_dynamic(in, out, threads);
+        total += (get_time() - start);
+    }
+    return total / REPEATS;
+}
+
+double benchmark_pthreads(double in[ROWS][COLS], double out[ROWS][COLS], int threads) {
+    double total = 0.0;
+    for (int r = 0; r < REPEATS; r++) {
+        double start = get_time();
+        smooth_pthreads(in, out, threads);
+        total += (get_time() - start);
+    }
+    return total / REPEATS;
 }
 
 void write_performance_csv(const char *filename,
@@ -211,20 +250,26 @@ void write_performance_csv(const char *filename,
 
     fprintf(fp,
             "threads,sequential_time,openmp_static_time,openmp_dynamic_time,pthreads_time,"
-            "speedup_openmp_static,speedup_openmp_dynamic,speedup_pthreads\n");
+            "speedup_openmp_static,speedup_openmp_dynamic,speedup_pthreads,"
+            "efficiency_openmp_static,efficiency_openmp_dynamic,efficiency_pthreads\n");
 
     for (int i = 0; i < ntests; i++) {
         double s1 = seq_time / omp_static_times[i];
         double s2 = seq_time / omp_dynamic_times[i];
         double s3 = (pth_times[i] > 0.0) ? (seq_time / pth_times[i]) : -1.0;
 
-        fprintf(fp, "%d,%.9f,%.9f,%.9f,%.9f,%.6f,%.6f,%.6f\n",
+        double e1 = s1 / t_counts[i];
+        double e2 = s2 / t_counts[i];
+        double e3 = (pth_times[i] > 0.0) ? (s3 / t_counts[i]) : -1.0;
+
+        fprintf(fp, "%d,%.9f,%.9f,%.9f,%.9f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                 t_counts[i],
                 seq_time,
                 omp_static_times[i],
                 omp_dynamic_times[i],
                 pth_times[i],
-                s1, s2, s3);
+                s1, s2, s3,
+                e1, e2, e3);
     }
 
     fclose(fp);
@@ -240,40 +285,24 @@ int main() {
     double omp_dynamic_times[MAX_THREADS_TEST];
     double pth_times[MAX_THREADS_TEST];
 
-    double start, seq_time;
+    double seq_time = benchmark_seq(grid, seq_output);
 
-    /* Sequential baseline */
-    start = get_time();
-    smooth_sequential(grid, seq_output);
-    seq_time = get_time() - start;
-
-    /* OpenMP static */
     for (int i = 0; i < num_tests; i++) {
-        start = get_time();
-        smooth_openmp_static(grid, omp_static_output, t_counts[i]);
-        omp_static_times[i] = get_time() - start;
+        omp_static_times[i] = benchmark_omp_static(grid, omp_static_output, t_counts[i]);
     }
 
-    /* OpenMP dynamic */
     for (int i = 0; i < num_tests; i++) {
-        start = get_time();
-        smooth_openmp_dynamic(grid, omp_dynamic_output, t_counts[i]);
-        omp_dynamic_times[i] = get_time() - start;
+        omp_dynamic_times[i] = benchmark_omp_dynamic(grid, omp_dynamic_output, t_counts[i]);
     }
 
-    /* pThreads */
     for (int i = 0; i < num_tests; i++) {
         if (t_counts[i] > ROWS) {
             pth_times[i] = -1.0;
             continue;
         }
-
-        start = get_time();
-        smooth_pthreads(grid, pth_output, t_counts[i]);
-        pth_times[i] = get_time() - start;
+        pth_times[i] = benchmark_pthreads(grid, pth_output, t_counts[i]);
     }
 
-    /* Correctness checks */
     int ok_static = compare_outputs(seq_output, omp_static_output, EPS);
     int ok_dynamic = compare_outputs(seq_output, omp_dynamic_output, EPS);
     int ok_pth = compare_outputs(seq_output, pth_output, EPS);
@@ -283,7 +312,7 @@ int main() {
     printf("OpenMP dynamic : %s\n", ok_dynamic ? "PASS" : "FAIL");
     printf("pThreads       : %s\n", ok_pth ? "PASS" : "FAIL");
 
-    printf("\n=== Performance Comparison (single-run timing, grid 24x200) ===\n");
+    printf("\n=== Performance Comparison (average of %d runs, grid 24x200) ===\n", REPEATS);
     printf("Sequential baseline: %.9f s\n\n", seq_time);
 
     printf("%-8s | %-15s | %-15s | %-15s | %-12s | %-12s | %-12s\n",
